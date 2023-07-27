@@ -6,7 +6,6 @@ import gc
 import math
 import os
 from multiprocessing import Value
-import toml
 
 from tqdm import tqdm
 import torch
@@ -24,9 +23,12 @@ from library.custom_train_functions import (
     apply_snr_weight,
     get_weighted_text_embeddings,
     prepare_scheduler_for_custom_training,
+    pyramid_noise_like,
+    apply_noise_offset,
     scale_v_prediction_loss_like_noise_prediction,
 )
 
+from store import AspectBucket, ImageStore, AspectDataset, AspectBucketSampler
 
 def train(args):
     train_util.verify_training_args(args)
@@ -40,55 +42,9 @@ def train(args):
     tokenizer = train_util.load_tokenizer(args)
 
     # データセットを準備する
-    if args.dataset_class is None:
-        blueprint_generator = BlueprintGenerator(ConfigSanitizer(False, True, False, True))
-        if args.dataset_config is not None:
-            print(f"Load dataset config from {args.dataset_config}")
-            user_config = config_util.load_user_config(args.dataset_config)
-            ignored = ["train_data_dir", "in_json"]
-            if any(getattr(args, attr) is not None for attr in ignored):
-                print(
-                    "ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(
-                        ", ".join(ignored)
-                    )
-                )
-        else:
-            user_config = {
-                "datasets": [
-                    {
-                        "subsets": [
-                            {
-                                "image_dir": args.train_data_dir,
-                                "metadata_file": args.in_json,
-                            }
-                        ]
-                    }
-                ]
-            }
-
-        blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-    else:
-        train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizer)
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
-    ds_for_collater = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-    collater = train_util.collater_class(current_epoch, current_step, ds_for_collater)
-
-    if args.debug_dataset:
-        train_util.debug_dataset(train_dataset_group)
-        return
-    if len(train_dataset_group) == 0:
-        print(
-            "No data found. Please verify the metadata file and train_data_dir option. / 画像がありません。メタデータおよびtrain_data_dirオプションを確認してください。"
-        )
-        return
-
-    if cache_latents:
-        assert (
-            train_dataset_group.is_latent_cacheable()
-        ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
 
     # acceleratorを準備する
     print("prepare accelerator")
@@ -144,20 +100,6 @@ def train(args):
         set_diffusers_xformers_flag(unet, False)
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
 
-    # 学習を準備する
-    if cache_latents:
-        vae.to(accelerator.device, dtype=weight_dtype)
-        vae.requires_grad_(False)
-        vae.eval()
-        with torch.no_grad():
-            train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
-        vae.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        accelerator.wait_for_everyone()
-
     # 学習を準備する：モデルを適切な状態にする
     training_models = []
     if args.gradient_checkpointing:
@@ -197,13 +139,33 @@ def train(args):
     # dataloaderを準備する
     # DataLoaderのプロセス数：0はメインプロセスになる
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count() - 1)  # cpu_count-1 ただし最大で指定された数まで
+    bucket = AspectBucket(ImageStore(), 1)
+    dataset = AspectDataset(bucket)
+    sampler = AspectBucketSampler(bucket=bucket, dataset=dataset)
+
+    def collate_fn(examples):
+        valid_examples = []
+        for i in range(len(examples)):
+            if examples[i][0] is not None or is_valid_image(examples[i][0]):
+                valid_examples.append(examples[i])
+            else:
+                if valid_examples:
+                    examples[i] = random.choice(valid_examples)
+                else:
+                    raise ValueError("No valid images in batch")
+        return_dict = {
+            "latents": [example[0] for example in examples],
+            "input_ids": [drop_random(example[1]) for example in examples],
+            "source_name": [example[2] for example in examples],
+            "source_id": [example[3] for example in examples]
+        }
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset_group,
         batch_size=1,
         shuffle=True,
-        collate_fn=collater,
-        num_workers=n_workers,
-        persistent_workers=args.persistent_data_loader_workers,
+        collate_fn=collate_fn,
+        num_workers=2,
     )
 
     # 学習ステップ数を計算する
@@ -212,9 +174,6 @@ def train(args):
             len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
         )
         accelerator.print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
-
-    # データセット側にも学習ステップを送信
-    train_dataset_group.set_max_train_steps(args.max_train_steps)
 
     # lr schedulerを用意する
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
@@ -255,7 +214,6 @@ def train(args):
     # 学習する
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     accelerator.print("running training / 学習開始")
-    accelerator.print(f"  num examples / サンプル数: {train_dataset_group.num_train_images}")
     accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
     accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
     accelerator.print(f"  batch size per device / バッチサイズ: {args.train_batch_size}")
@@ -272,14 +230,9 @@ def train(args):
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
     )
     prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
-    if args.zero_terminal_snr:
-        custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
 
     if accelerator.is_main_process:
-        init_kwargs = {}
-        if args.log_tracker_config is not None:
-            init_kwargs = toml.load(args.log_tracker_config)
-        accelerator.init_trackers("finetuning" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs)
+        accelerator.init_trackers("finetuning" if args.log_tracker_name is None else args.log_tracker_name)
 
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -297,7 +250,7 @@ def train(args):
                         latents = batch["latents"].to(accelerator.device)  # .to(dtype=weight_dtype)
                     else:
                         # latentに変換
-                        latents = vae.encode(batch["images"].to(dtype=weight_dtype)).latent_dist.sample()
+                        latents = vae.encode(batch["latents"].to(dtype=weight_dtype)).latent_dist.sample()
                     latents = latents * 0.18215
                 b_size = latents.shape[0]
 

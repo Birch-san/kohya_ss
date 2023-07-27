@@ -33,8 +33,8 @@ class SourceModel:
                     label='Model Quick Pick',
                     choices=[
                         'custom',
-                        # 'stabilityai/stable-diffusion-xl-base-0.9',
-                        # 'stabilityai/stable-diffusion-xl-refiner-0.9',
+                        'stabilityai/stable-diffusion-xl-base-0.9',
+                        'stabilityai/stable-diffusion-xl-refiner-0.9',
                         'stabilityai/stable-diffusion-2-1-base/blob/main/v2-1_512-ema-pruned',
                         'stabilityai/stable-diffusion-2-1-base',
                         'stabilityai/stable-diffusion-2-base',
@@ -80,7 +80,6 @@ class SourceModel:
                     outputs=self.pretrained_model_name_or_path,
                     show_progress=False,
                 )
-            with gr.Row():
                 self.v2 = gr.Checkbox(label='v2', value=False, visible=False)
                 self.v_parameterization = gr.Checkbox(
                     label='v_parameterization', value=False, visible=False

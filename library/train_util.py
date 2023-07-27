@@ -50,7 +50,6 @@ from diffusers import (
     HeunDiscreteScheduler,
     KDPM2DiscreteScheduler,
     KDPM2AncestralDiscreteScheduler,
-    AutoencoderKL,
 )
 from library import custom_train_functions
 from library.original_unet import UNet2DConditionModel
@@ -65,9 +64,8 @@ import safetensors.torch
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
-# from library.attention_processors import FlashAttnProcessor
-# from library.hypernetwork import replace_attentions_for_hypernetwork
-from library.original_unet import UNet2DConditionModel
+from library.attention_processors import FlashAttnProcessor
+from library.hypernetwork import replace_attentions_for_hypernetwork
 
 # Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
@@ -90,22 +88,6 @@ STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
-try:
-    import pillow_avif
-
-    IMAGE_EXTENSIONS.extend([".avif", ".AVIF"])
-except:
-    pass
-
-IMAGE_TRANSFORMS = transforms.Compose(
-    [
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ]
-)
-
-TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
-
 
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
@@ -120,15 +102,10 @@ class ImageInfo:
         self.latents: torch.Tensor = None
         self.latents_flipped: torch.Tensor = None
         self.latents_npz: str = None
+        self.latents_npz_flipped: str = None
         self.latents_original_size: Tuple[int, int] = None  # original image size, not latents size
-        self.latents_crop_ltrb: Tuple[int, int] = None  # crop left top right bottom in original pixel size, not latents size
+        self.latents_crop_left_top: Tuple[int, int] = None  # original image crop left top, not latents crop left top
         self.cond_img_path: str = None
-        self.image: Optional[Image.Image] = None  # optional, original PIL Image
-        # SDXL, optional
-        self.text_encoder_outputs_npz: Optional[str] = None
-        self.text_encoder_outputs1: Optional[torch.Tensor] = None
-        self.text_encoder_outputs2: Optional[torch.Tensor] = None
-        self.text_encoder_pool2: Optional[torch.Tensor] = None
 
 
 class BucketManager:
@@ -255,26 +232,6 @@ class BucketManager:
 
         ar_error = (reso[0] / reso[1]) - aspect_ratio
         return reso, resized_size, ar_error
-
-    @staticmethod
-    def get_crop_ltrb(bucket_reso: Tuple[int, int], image_size: Tuple[int, int]):
-        # Stability AIの前処理に合わせてcrop left/topを計算する。crop rightはflipのaugmentationのために求める
-        # Calculate crop left/top according to the preprocessing of Stability AI. Crop right is calculated for flip augmentation.
-
-        bucket_ar = bucket_reso[0] / bucket_reso[1]
-        image_ar = image_size[0] / image_size[1]
-        if bucket_ar > image_ar:
-            # bucketのほうが横長→縦を合わせる
-            resized_width = bucket_reso[1] * image_ar
-            resized_height = bucket_reso[1]
-        else:
-            resized_width = bucket_reso[0]
-            resized_height = bucket_reso[0] / image_ar
-        crop_left = (bucket_reso[0] - resized_width) // 2
-        crop_top = (bucket_reso[1] - resized_height) // 2
-        crop_right = crop_left + resized_width
-        crop_bottom = crop_top + resized_height
-        return crop_left, crop_top, crop_right, crop_bottom
 
 
 class BucketBatchIndex(NamedTuple):
@@ -542,21 +499,20 @@ class BaseDataset(torch.utils.data.Dataset):
         # augmentation
         self.aug_helper = AugHelper()
 
-        self.image_transforms = IMAGE_TRANSFORMS
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
 
         self.replacements = {}
 
-        # caching
-        self.caching_mode = None  # None, 'latents', 'text'
-
     def set_seed(self, seed):
         self.seed = seed
-
-    def set_caching_mode(self, mode):
-        self.caching_mode = mode
 
     def set_current_epoch(self, epoch):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
@@ -616,11 +572,11 @@ class BaseDataset(torch.utils.data.Dataset):
                 def dropout_tags(tokens):
                     if subset.caption_tag_dropout_rate <= 0:
                         return tokens
-                    l = []
+                    lat = []
                     for token in tokens:
                         if random.random() >= subset.caption_tag_dropout_rate:
-                            l.append(token)
-                    return l
+                            lat.append(token)
+                    return lat
 
                 fixed_tokens = []
                 flex_tokens = tokens[:]
@@ -803,6 +759,45 @@ class BaseDataset(torch.utils.data.Dataset):
         random.shuffle(self.buckets_indices)
         self.bucket_manager.shuffle()
 
+    def load_image(self, image_path):
+        image = Image.open(image_path)
+        if not image.mode == "RGB":
+            image = image.convert("RGB")
+        img = np.array(image, np.uint8)
+        return img
+
+    # 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top)
+    def trim_and_resize_if_required(
+        self, subset: BaseSubset, image, reso, resized_size
+    ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]:
+        image_height, image_width = image.shape[0:2]
+
+        if image_width != resized_size[0] or image_height != resized_size[1]:
+            # リサイズする
+            image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
+
+        image_height, image_width = image.shape[0:2]
+        original_size = (image_width, image_height)
+
+        crop_left_top = (0, 0)
+        if image_width > reso[0]:
+            trim_size = image_width - reso[0]
+            p = trim_size // 2 if not subset.random_crop else random.randint(0, trim_size)
+            # print("w", trim_size, p)
+            image = image[:, p : p + reso[0]]
+            crop_left_top = (p, 0)
+        if image_height > reso[1]:
+            trim_size = image_height - reso[1]
+            p = trim_size // 2 if not subset.random_crop else random.randint(0, trim_size)
+            # print("h", trim_size, p)
+            image = image[p : p + reso[1]]
+            crop_left_top = (crop_left_top[0], p)
+
+        assert (
+            image.shape[0] == reso[1] and image.shape[1] == reso[0]
+        ), f"internal error, illegal trimmed size: {image.shape}, {reso}"
+        return image, original_size, crop_left_top
+
     def is_latent_cacheable(self):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
 
@@ -819,8 +814,28 @@ class BaseDataset(torch.utils.data.Dataset):
             ]
         )
 
+    def is_disk_cached_latents_is_expected(self, reso, npz_path, flipped_npz_path):
+        expected_latents_size = (reso[1] // 8, reso[0] // 8)  # bucket_resoはWxHなので注意
+
+        for npath in [npz_path, flipped_npz_path]:
+            if npath is None:
+                continue
+            if not os.path.exists(npath):
+                return False
+
+            npz = np.load(npath)
+            if "latents" not in npz or "original_size" not in npz or "crop_left_top" not in npz:  # old ver?
+                return False
+
+            cached_latents = npz["latents"]
+
+            if cached_latents.shape[1:3] != expected_latents_size:
+                return False
+
+        return True
+
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True):
-        # マルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
+        # ちょっと速くした
         print("caching latents.")
 
         image_infos = list(self.image_data.values())
@@ -831,20 +846,28 @@ class BaseDataset(torch.utils.data.Dataset):
         # split by resolution
         batches = []
         batch = []
-        print("checking cache validity...")
-        for info in tqdm(image_infos):
+        for info in image_infos:
             subset = self.image_to_subset[info.image_key]
 
-            if info.latents_npz is not None:  # fine tuning dataset
+            if info.latents_npz is not None:
+                info.latents, info.latents_original_size, info.latents_crop_left_top = self.load_latents_from_npz(info, False)
+                info.latents = torch.FloatTensor(info.latents)
+
+                info.latents_flipped, _, _ = self.load_latents_from_npz(info, True)  # might be None
+                if info.latents_flipped is not None:
+                    info.latents_flipped = torch.FloatTensor(info.latents_flipped)
                 continue
 
             # check disk cache exists and size of latents
             if cache_to_disk:
                 info.latents_npz = os.path.splitext(info.absolute_path)[0] + ".npz"
-                if not is_main_process:  # store to info only
+                info.latents_npz_flipped = os.path.splitext(info.absolute_path)[0] + "_flip.npz"
+                if not is_main_process:
                     continue
 
-                cache_available = is_disk_cached_latents_is_expected(info.bucket_reso, info.latents_npz, subset.flip_aug)
+                cache_available = self.is_disk_cached_latents_is_expected(
+                    info.bucket_reso, info.latents_npz, info.latents_npz_flipped if subset.flip_aug else None
+                )
 
                 if cache_available:  # do not add to batch
                     continue
@@ -864,83 +887,60 @@ class BaseDataset(torch.utils.data.Dataset):
         if len(batch) > 0:
             batches.append(batch)
 
-        if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
+        if cache_to_disk and not is_main_process:  # don't cache latents in non-main process, set to info only
             return
 
-        # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
-        print("caching latents...")
+        # iterate batches
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.random_crop)
+            images = []
+            for info in batch:
+                image = self.load_image(info.absolute_path)
+                image, original_size, crop_left_top = self.trim_and_resize_if_required(
+                    subset, image, info.bucket_reso, info.resized_size
+                )
+                image = self.image_transforms(image)
+                images.append(image)
 
-    # weight_dtypeを指定するとText Encoderそのもの、およひ出力がweight_dtypeになる
-    # SDXLでのみ有効だが、datasetのメソッドとする必要があるので、sdxl_train_util.pyではなくこちらに実装する
-    # SD1/2に対応するにはv2のフラグを持つ必要があるので後回し
-    def cache_text_encoder_outputs(
-        self, tokenizers, text_encoders, device, weight_dtype, cache_to_disk=False, is_main_process=True
-    ):
-        assert len(tokenizers) == 2, "only support SDXL"
+                info.latents_original_size = original_size
+                info.latents_crop_left_top = crop_left_top
 
-        # latentsのキャッシュと同様に、ディスクへのキャッシュに対応する
-        # またマルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
-        print("caching text encoder outputs.")
-        image_infos = list(self.image_data.values())
+            img_tensors = torch.stack(images, dim=0)
+            img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
 
-        print("checking cache existence...")
-        image_infos_to_cache = []
-        for info in tqdm(image_infos):
-            # subset = self.image_to_subset[info.image_key]
-            if cache_to_disk:
-                te_out_npz = os.path.splitext(info.absolute_path)[0] + TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX
-                info.text_encoder_outputs_npz = te_out_npz
+            latents = vae.encode(img_tensors).latent_dist.sample().to("cpu")
 
-                if not is_main_process:  # store to info only
-                    continue
+            for info, latent in zip(batch, latents):
+                # check NaN
+                if torch.isnan(latents).any():
+                    raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
 
-                if os.path.exists(te_out_npz):
-                    continue
+                if cache_to_disk:
+                    save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_left_top)
+                else:
+                    info.latents = latent
 
-            image_infos_to_cache.append(info)
+            if subset.flip_aug:
+                img_tensors = torch.flip(img_tensors, dims=[3])
+                latents = vae.encode(img_tensors).latent_dist.sample().to("cpu")
+                for info, latent in zip(batch, latents):
+                    # check NaN
+                    if torch.isnan(latents).any():
+                        raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
 
-        if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
-            return
-
-        # prepare tokenizers and text encoders
-        for text_encoder in text_encoders:
-            text_encoder.to(device)
-            if weight_dtype is not None:
-                text_encoder.to(dtype=weight_dtype)
-
-        # create batch
-        batch = []
-        batches = []
-        for info in image_infos_to_cache:
-            input_ids1 = self.get_input_ids(info.caption, tokenizers[0])
-            input_ids2 = self.get_input_ids(info.caption, tokenizers[1])
-            batch.append((info, input_ids1, input_ids2))
-
-            if len(batch) >= self.batch_size:
-                batches.append(batch)
-                batch = []
-
-        if len(batch) > 0:
-            batches.append(batch)
-
-        # iterate batches: call text encoder and cache outputs for memory or disk
-        print("caching text encoder outputs...")
-        for batch in tqdm(batches):
-            infos, input_ids1, input_ids2 = zip(*batch)
-            input_ids1 = torch.stack(input_ids1, dim=0)
-            input_ids2 = torch.stack(input_ids2, dim=0)
-            cache_batch_text_encoder_outputs(
-                infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, weight_dtype
-            )
+                    if cache_to_disk:
+                        # crop_left_top is reversed when making batch
+                        save_latents_to_disk(
+                            info.latents_npz_flipped, latent, info.latents_original_size, info.latents_crop_left_top
+                        )
+                    else:
+                        info.latents_flipped = latent
 
     def get_image_size(self, image_path):
         image = Image.open(image_path)
         return image.size
 
     def load_image_with_face_info(self, subset: BaseSubset, image_path: str):
-        img = load_image(image_path)
+        img = self.load_image(image_path)
 
         face_cx = face_cy = face_w = face_h = 0
         if subset.face_crop_aug_range is not None:
@@ -1001,6 +1001,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return image
 
+    def load_latents_from_npz(self, image_info: ImageInfo, flipped):
+        npz_file = image_info.latents_npz_flipped if flipped else image_info.latents_npz
+        return load_latents_from_disk(npz_file)
+
     def __len__(self):
         return self._length
 
@@ -1008,9 +1012,6 @@ class BaseDataset(torch.utils.data.Dataset):
         bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index = self.buckets_indices[index].batch_index * bucket_batch_size
-
-        if self.caching_mode is not None:  # return batch for latents/text encoder outputs caching
-            return self.get_item_for_caching(bucket, bucket_batch_size, image_index)
 
         loss_weights = []
         captions = []
@@ -1022,9 +1023,6 @@ class BaseDataset(torch.utils.data.Dataset):
         crop_top_lefts = []
         target_sizes_hw = []
         flippeds = []  # 変数名が微妙
-        text_encoder_outputs1_list = []
-        text_encoder_outputs2_list = []
-        text_encoder_pool2_list = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1036,7 +1034,7 @@ class BaseDataset(torch.utils.data.Dataset):
             # image/latentsを処理する
             if image_info.latents is not None:  # cache_latents=Trueの場合
                 original_size = image_info.latents_original_size
-                crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
+                crop_left_top = image_info.latents_crop_left_top  # calc values later if flipped
                 if not flipped:
                     latents = image_info.latents
                 else:
@@ -1044,10 +1042,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents = load_latents_from_disk(image_info.latents_npz)
-                if flipped:
-                    latents = flipped_latents
-                    del flipped_latents
+                latents, original_size, crop_left_top = self.load_latents_from_npz(image_info, flipped)
                 latents = torch.FloatTensor(latents)
 
                 image = None
@@ -1057,8 +1052,8 @@ class BaseDataset(torch.utils.data.Dataset):
                 im_h, im_w = img.shape[0:2]
 
                 if self.enable_bucket:
-                    img, original_size, crop_ltrb = trim_and_resize_if_required(
-                        subset.random_crop, img, image_info.bucket_reso, image_info.resized_size
+                    img, original_size, crop_left_top = self.trim_and_resize_if_required(
+                        subset, img, image_info.bucket_reso, image_info.resized_size
                     )
                 else:
                     if face_cx > 0:  # 顔位置情報あり
@@ -1080,7 +1075,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
 
                     original_size = [im_w, im_h]
-                    crop_ltrb = (0, 0, 0, 0)
+                    crop_left_top = [0, 0]
 
                 # augmentation
                 aug = self.aug_helper.get_augmentor(subset.color_aug)
@@ -1098,87 +1093,52 @@ class BaseDataset(torch.utils.data.Dataset):
 
             target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
 
-            if not flipped:
-                crop_left_top = (crop_ltrb[0], crop_ltrb[1])
-            else:
-                # crop_ltrb[2] is right, so target_size[0] - crop_ltrb[2] is left in flipped image
-                crop_left_top = (target_size[0] - crop_ltrb[2], crop_ltrb[1])
+            if flipped:
+                crop_left_top = (original_size[0] - crop_left_top[0] - target_size[0], crop_left_top[1])
 
-            original_sizes_hw.append((int(original_size[1]), int(original_size[0])))
-            crop_top_lefts.append((int(crop_left_top[1]), int(crop_left_top[0])))
-            target_sizes_hw.append((int(target_size[1]), int(target_size[0])))
+            original_sizes_hw.append((original_size[1], original_size[0]))
+            crop_top_lefts.append((crop_left_top[1], crop_left_top[0]))
+            target_sizes_hw.append((target_size[1], target_size[0]))
             flippeds.append(flipped)
 
-            # captionとtext encoder outputを処理する
-            caption = image_info.caption  # default
-            if image_info.text_encoder_outputs1 is not None:
-                text_encoder_outputs1_list.append(image_info.text_encoder_outputs1)
-                text_encoder_outputs2_list.append(image_info.text_encoder_outputs2)
-                text_encoder_pool2_list.append(image_info.text_encoder_pool2)
-                captions.append(caption)
-            elif image_info.text_encoder_outputs_npz is not None:
-                text_encoder_outputs1, text_encoder_outputs2, text_encoder_pool2 = load_text_encoder_outputs_from_disk(
-                    image_info.text_encoder_outputs_npz
-                )
-                text_encoder_outputs1_list.append(text_encoder_outputs1)
-                text_encoder_outputs2_list.append(text_encoder_outputs2)
-                text_encoder_pool2_list.append(text_encoder_pool2)
-                captions.append(caption)
+            caption = self.process_caption(subset, image_info.caption)
+            if self.XTI_layers:
+                caption_layer = []
+                for layer in self.XTI_layers:
+                    token_strings_from = " ".join(self.token_strings)
+                    token_strings_to = " ".join([f"{x}_{layer}" for x in self.token_strings])
+                    caption_ = caption.replace(token_strings_from, token_strings_to)
+                    caption_layer.append(caption_)
+                captions.append(caption_layer)
             else:
-                caption = self.process_caption(subset, image_info.caption)
+                captions.append(caption)
+
+            if not self.token_padding_disabled:  # this option might be omitted in future
                 if self.XTI_layers:
-                    caption_layer = []
-                    for layer in self.XTI_layers:
-                        token_strings_from = " ".join(self.token_strings)
-                        token_strings_to = " ".join([f"{x}_{layer}" for x in self.token_strings])
-                        caption_ = caption.replace(token_strings_from, token_strings_to)
-                        caption_layer.append(caption_)
-                    captions.append(caption_layer)
+                    token_caption = self.get_input_ids(caption_layer, self.tokenizers[0])
                 else:
-                    captions.append(caption)
+                    token_caption = self.get_input_ids(caption, self.tokenizers[0])
+                input_ids_list.append(token_caption)
 
-                if not self.token_padding_disabled:  # this option might be omitted in future
+                if len(self.tokenizers) > 1:
                     if self.XTI_layers:
-                        token_caption = self.get_input_ids(caption_layer, self.tokenizers[0])
+                        token_caption2 = self.get_input_ids(caption_layer, self.tokenizers[1])
                     else:
-                        token_caption = self.get_input_ids(caption, self.tokenizers[0])
-                    input_ids_list.append(token_caption)
-
-                    if len(self.tokenizers) > 1:
-                        if self.XTI_layers:
-                            token_caption2 = self.get_input_ids(caption_layer, self.tokenizers[1])
-                        else:
-                            token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
-                        input_ids2_list.append(token_caption2)
+                        token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
+                    input_ids2_list.append(token_caption2)
 
         example = {}
         example["loss_weights"] = torch.FloatTensor(loss_weights)
 
-        if len(text_encoder_outputs1_list) == 0:
-            if self.token_padding_disabled:
-                # padding=True means pad in the batch
-                example["input_ids"] = self.tokenizer[0](captions, padding=True, truncation=True, return_tensors="pt").input_ids
-                if len(self.tokenizers) > 1:
-                    example["input_ids2"] = self.tokenizer[1](
-                        captions, padding=True, truncation=True, return_tensors="pt"
-                    ).input_ids
-                else:
-                    example["input_ids2"] = None
-            else:
-                example["input_ids"] = torch.stack(input_ids_list)
-                example["input_ids2"] = torch.stack(input_ids2_list) if len(self.tokenizers) > 1 else None
-            example["text_encoder_outputs1_list"] = None
-            example["text_encoder_outputs2_list"] = None
-            example["text_encoder_pool2_list"] = None
+        if self.token_padding_disabled:
+            # padding=True means pad in the batch
+            example["input_ids"] = self.tokenizer[0](captions, padding=True, truncation=True, return_tensors="pt").input_ids
+            if len(self.tokenizers) > 1:
+                # following may not work in SDXL, keep the line for future update
+                example["input_ids2"] = self.tokenizer[1](captions, padding=True, truncation=True, return_tensors="pt").input_ids
         else:
-            example["input_ids"] = None
-            example["input_ids2"] = None
-            # # for assertion
-            # example["input_ids"] = torch.stack([self.get_input_ids(cap, self.tokenizers[0]) for cap in captions])
-            # example["input_ids2"] = torch.stack([self.get_input_ids(cap, self.tokenizers[1]) for cap in captions])
-            example["text_encoder_outputs1_list"] = torch.stack(text_encoder_outputs1_list)
-            example["text_encoder_outputs2_list"] = torch.stack(text_encoder_outputs2_list)
-            example["text_encoder_pool2_list"] = torch.stack(text_encoder_pool2_list)
+            example["input_ids"] = torch.stack(input_ids_list)
+            example["input_ids2"] = torch.stack(input_ids2_list) if len(self.tokenizers) > 1 else None
 
         if images[0] is not None:
             images = torch.stack(images)
@@ -1197,67 +1157,6 @@ class BaseDataset(torch.utils.data.Dataset):
 
         if self.debug_dataset:
             example["image_keys"] = bucket[image_index : image_index + self.batch_size]
-        return example
-
-    def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
-        captions = []
-        images = []
-        input_ids1_list = []
-        input_ids2_list = []
-        absolute_paths = []
-        resized_sizes = []
-        bucket_reso = None
-        flip_aug = None
-        random_crop = None
-
-        for image_key in bucket[image_index : image_index + bucket_batch_size]:
-            image_info = self.image_data[image_key]
-            subset = self.image_to_subset[image_key]
-
-            if flip_aug is None:
-                flip_aug = subset.flip_aug
-                random_crop = subset.random_crop
-                bucket_reso = image_info.bucket_reso
-            else:
-                assert flip_aug == subset.flip_aug, "flip_aug must be same in a batch"
-                assert random_crop == subset.random_crop, "random_crop must be same in a batch"
-                assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
-
-            caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
-
-            if self.caching_mode == "latents":
-                image = load_image(image_info.absolute_path)
-            else:
-                image = None
-
-            if self.caching_mode == "text":
-                input_ids1 = self.get_input_ids(caption, self.tokenizers[0])
-                input_ids2 = self.get_input_ids(caption, self.tokenizers[1])
-            else:
-                input_ids1 = None
-                input_ids2 = None
-
-            captions.append(caption)
-            images.append(image)
-            input_ids1_list.append(input_ids1)
-            input_ids2_list.append(input_ids2)
-            absolute_paths.append(image_info.absolute_path)
-            resized_sizes.append(image_info.resized_size)
-
-        example = {}
-
-        if images[0] is None:
-            images = None
-        example["images"] = images
-
-        example["captions"] = captions
-        example["input_ids1_list"] = input_ids1_list
-        example["input_ids2_list"] = input_ids2_list
-        example["absolute_paths"] = absolute_paths
-        example["resized_sizes"] = resized_sizes
-        example["flip_aug"] = flip_aug
-        example["random_crop"] = random_crop
-        example["bucket_reso"] = bucket_reso
         return example
 
 
@@ -1557,10 +1456,10 @@ class FineTuningDataset(BaseDataset):
 
             if not npz_any:
                 use_npz_latents = False
-                print(f"npz file does not exist. ignore npz files / npzファイルが見つからないためnpzファイルを無視します")
+                print("npz file does not exist. ignore npz files / npzファイルが見つからないためnpzファイルを無視します")
             elif not npz_all:
                 use_npz_latents = False
-                print(f"some of npz file does not exist. ignore npz files / いくつかのnpzファイルが見つからないためnpzファイルを無視します")
+                print("some of npz file does not exist. ignore npz files / いくつかのnpzファイルが見つからないためnpzファイルを無視します")
                 if flip_aug_in_subset:
                     print("maybe no flipped files / 反転されたnpzファイルがないのかもしれません")
         # else:
@@ -1580,7 +1479,7 @@ class FineTuningDataset(BaseDataset):
         if sizes is None:
             if use_npz_latents:
                 use_npz_latents = False
-                print(f"npz files exist, but no bucket info in metadata. ignore npz files / メタデータにbucket情報がないためnpzファイルを無視します")
+                print("npz files exist, but no bucket info in metadata. ignore npz files / メタデータにbucket情報がないためnpzファイルを無視します")
 
             assert (
                 resolution is not None
@@ -1733,7 +1632,11 @@ class ControlNetDataset(BaseDataset):
         assert len(missing_imgs) == 0, f"missing conditioning data for {len(missing_imgs)} images: {missing_imgs}"
         assert len(extra_imgs) == 0, f"extra conditioning data for {len(extra_imgs)} images: {extra_imgs}"
 
-        self.conditioning_image_transforms = IMAGE_TRANSFORMS
+        self.conditioning_image_transforms = transforms.Compose(
+            [
+                transforms.ToTensor(),
+            ]
+        )
 
     def make_buckets(self):
         self.dreambooth_dataset_delegate.make_buckets()
@@ -1761,7 +1664,7 @@ class ControlNetDataset(BaseDataset):
             original_size_hw = example["original_sizes_hw"][i]
             crop_top_left = example["crop_top_lefts"][i]
             flipped = example["flippeds"][i]
-            cond_img = load_image(image_info.cond_img_path)
+            cond_img = self.load_image(image_info.cond_img_path)
 
             if self.dreambooth_dataset_delegate.enable_bucket:
                 cond_img = cv2.resize(cond_img, image_info.resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
@@ -1823,17 +1726,6 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             print(f"[Dataset {i}]")
             dataset.cache_latents(vae, vae_batch_size, cache_to_disk, is_main_process)
 
-    def cache_text_encoder_outputs(
-        self, tokenizers, text_encoders, device, weight_dtype, cache_to_disk=False, is_main_process=True
-    ):
-        for i, dataset in enumerate(self.datasets):
-            print(f"[Dataset {i}]")
-            dataset.cache_text_encoder_outputs(tokenizers, text_encoders, device, weight_dtype, cache_to_disk, is_main_process)
-
-    def set_caching_mode(self, caching_mode):
-        for dataset in self.datasets:
-            dataset.set_caching_mode(caching_mode)
-
     def is_latent_cacheable(self) -> bool:
         return all([dataset.is_latent_cacheable() for dataset in self.datasets])
 
@@ -1857,52 +1749,28 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.disable_token_padding()
 
 
-def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool):
-    expected_latents_size = (reso[1] // 8, reso[0] // 8)  # bucket_resoはWxHなので注意
-
-    if not os.path.exists(npz_path):
-        return False
-
-    npz = np.load(npz_path)
-    if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
-        return False
-    if npz["latents"].shape[1:3] != expected_latents_size:
-        return False
-
-    if flip_aug:
-        if "latents_flipped" not in npz:
-            return False
-        if npz["latents_flipped"].shape[1:3] != expected_latents_size:
-            return False
-
-    return True
-
-
 # 戻り値は、latents_tensor, (original_size width, original_size height), (crop left, crop top)
-def load_latents_from_disk(
-    npz_path,
-) -> Tuple[Optional[torch.Tensor], Optional[List[int]], Optional[List[int]], Optional[torch.Tensor]]:
+def load_latents_from_disk(npz_path) -> Tuple[Optional[torch.Tensor], Optional[List[int]], Optional[List[int]]]:
+    if npz_path is None:  # flipped doesn't exist
+        return None, None, None
+
     npz = np.load(npz_path)
     if "latents" not in npz:
-        raise ValueError(f"error: npz is old format. please re-generate {npz_path}")
+        print(f"error: npz is old format. please re-generate {npz_path}")
+        return None, None, None
 
     latents = npz["latents"]
     original_size = npz["original_size"].tolist()
-    crop_ltrb = npz["crop_ltrb"].tolist()
-    flipped_latents = npz["latents_flipped"] if "latents_flipped" in npz else None
-    return latents, original_size, crop_ltrb, flipped_latents
+    crop_left_top = npz["crop_left_top"].tolist()
+    return latents, original_size, crop_left_top
 
 
-def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None):
-    kwargs = {}
-    if flipped_latents_tensor is not None:
-        kwargs["latents_flipped"] = flipped_latents_tensor.float().cpu().numpy()
+def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_left_top):
     np.savez(
         npz_path,
         latents=latents_tensor.float().cpu().numpy(),
         original_size=np.array(original_size),
-        crop_ltrb=np.array(crop_ltrb),
-        **kwargs,
+        crop_left_top=np.array(crop_left_top),
     )
 
 
@@ -1940,7 +1808,7 @@ def debug_dataset(train_dataset, show_input_ids=False):
                 )
             ):
                 print(
-                    f'{ik}, size: {train_dataset.image_data[ik].image_size}, loss weight: {lw}, caption: "{cap}", original size: {orgsz}, crop top left: {crptl}, target size: {trgsz}, flipped: {flpdz}'
+                    f'{ik}, size: {train_dataset.image_data[ik].image_size}, loss weight: {lw}, caption: "{cap}", original size: {orgsz}, crop left top: {crptl}, target size: {trgsz}, flipped: {flpdz}'
                 )
 
                 if show_input_ids:
@@ -2077,145 +1945,6 @@ def load_arbitrary_dataset(args, tokenizer) -> MinimalDataset:
     return train_dataset_group
 
 
-def load_image(image_path):
-    image = Image.open(image_path)
-    if not image.mode == "RGB":
-        image = image.convert("RGB")
-    img = np.array(image, np.uint8)
-    return img
-
-
-# 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top, crop right, crop bottom)
-def trim_and_resize_if_required(
-    random_crop: bool, image: Image.Image, reso, resized_size: Tuple[int, int]
-) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
-    image_height, image_width = image.shape[0:2]
-    original_size = (image_width, image_height)  # size before resize
-
-    if image_width != resized_size[0] or image_height != resized_size[1]:
-        # リサイズする
-        image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
-
-    image_height, image_width = image.shape[0:2]
-
-    if image_width > reso[0]:
-        trim_size = image_width - reso[0]
-        p = trim_size // 2 if not random_crop else random.randint(0, trim_size)
-        # print("w", trim_size, p)
-        image = image[:, p : p + reso[0]]
-    if image_height > reso[1]:
-        trim_size = image_height - reso[1]
-        p = trim_size // 2 if not random_crop else random.randint(0, trim_size)
-        # print("h", trim_size, p)
-        image = image[p : p + reso[1]]
-
-    # random cropの場合のcropされた値をどうcrop left/topに反映するべきか全くアイデアがない
-    # I have no idea how to reflect the cropped value in crop left/top in the case of random crop
-
-    crop_ltrb = BucketManager.get_crop_ltrb(reso, original_size)
-
-    assert image.shape[0] == reso[1] and image.shape[1] == reso[0], f"internal error, illegal trimmed size: {image.shape}, {reso}"
-    return image, original_size, crop_ltrb
-
-
-def cache_batch_latents(
-    vae: AutoencoderKL, cache_to_disk: bool, image_infos: List[ImageInfo], flip_aug: bool, random_crop: bool
-) -> None:
-    r"""
-    requires image_infos to have: absolute_path, bucket_reso, resized_size, latents_npz
-    optionally requires image_infos to have: image
-    if cache_to_disk is True, set info.latents_npz
-        flipped latents is also saved if flip_aug is True
-    if cache_to_disk is False, set info.latents
-        latents_flipped is also set if flip_aug is True
-    latents_original_size and latents_crop_ltrb are also set
-    """
-    images = []
-    for info in image_infos:
-        image = load_image(info.absolute_path) if info.image is None else np.array(info.image, np.uint8)
-        # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
-        image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size)
-        image = IMAGE_TRANSFORMS(image)
-        images.append(image)
-
-        info.latents_original_size = original_size
-        info.latents_crop_ltrb = crop_ltrb
-
-    img_tensors = torch.stack(images, dim=0)
-    img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
-
-    with torch.no_grad():
-        latents = vae.encode(img_tensors).latent_dist.sample().to("cpu")
-
-    if flip_aug:
-        img_tensors = torch.flip(img_tensors, dims=[3])
-        with torch.no_grad():
-            flipped_latents = vae.encode(img_tensors).latent_dist.sample().to("cpu")
-    else:
-        flipped_latents = [None] * len(latents)
-
-    for info, latent, flipped_latent in zip(image_infos, latents, flipped_latents):
-        # check NaN
-        if torch.isnan(latents).any() or (flipped_latent is not None and torch.isnan(flipped_latent).any()):
-            raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
-
-        if cache_to_disk:
-            save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_ltrb, flipped_latent)
-        else:
-            info.latents = latent
-            if flip_aug:
-                info.latents_flipped = flipped_latent
-
-
-def cache_batch_text_encoder_outputs(
-    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, input_ids1, input_ids2, dtype
-):
-    input_ids1 = input_ids1.to(text_encoders[0].device)
-    input_ids2 = input_ids2.to(text_encoders[1].device)
-
-    with torch.no_grad():
-        b_hidden_state1, b_hidden_state2, b_pool2 = get_hidden_states_sdxl(
-            max_token_length,
-            input_ids1,
-            input_ids2,
-            tokenizers[0],
-            tokenizers[1],
-            text_encoders[0],
-            text_encoders[1],
-            dtype,
-        )
-
-        # ここでcpuに移動しておかないと、上書きされてしまう
-        b_hidden_state1 = b_hidden_state1.detach().to("cpu")  # b,n*75+2,768
-        b_hidden_state2 = b_hidden_state2.detach().to("cpu")  # b,n*75+2,1280
-        b_pool2 = b_pool2.detach().to("cpu")  # b,1280
-
-    for info, hidden_state1, hidden_state2, pool2 in zip(image_infos, b_hidden_state1, b_hidden_state2, b_pool2):
-        if cache_to_disk:
-            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, hidden_state1, hidden_state2, pool2)
-        else:
-            info.text_encoder_outputs1 = hidden_state1
-            info.text_encoder_outputs2 = hidden_state2
-            info.text_encoder_pool2 = pool2
-
-
-def save_text_encoder_outputs_to_disk(npz_path, hidden_state1, hidden_state2, pool2):
-    np.savez(
-        npz_path,
-        hidden_state1=hidden_state1.cpu().float().numpy(),
-        hidden_state2=hidden_state2.cpu().float().numpy(),
-        pool2=pool2.cpu().float().numpy(),
-    )
-
-
-def load_text_encoder_outputs_from_disk(npz_path):
-    with np.load(npz_path) as f:
-        hidden_state1 = torch.from_numpy(f["hidden_state1"])
-        hidden_state2 = torch.from_numpy(f["hidden_state2"]) if "hidden_state2" in f else None
-        pool2 = torch.from_numpy(f["pool2"]) if "pool2" in f else None
-    return hidden_state1, hidden_state2, pool2
-
-
 # endregion
 
 # region モジュール入れ替え部
@@ -2324,7 +2053,7 @@ def addnet_hash_safetensors(b):
 def get_git_revision_hash() -> str:
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__)).decode("ascii").strip()
-    except:
+    except Exception:
         return "(unknown)"
 
 
@@ -2687,9 +2416,6 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     )
     parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
     parser.add_argument(
-        "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
-    )  # TODO move to SDXL training, because it is not supported by SD1/2
-    parser.add_argument(
         "--clip_skip",
         type=int,
         default=None,
@@ -2714,12 +2440,6 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         type=str,
         default=None,
         help="name of tracker to use for logging, default is script-specific default name / ログ出力に使用するtrackerの名前、省略時はスクリプトごとのデフォルト名",
-    )
-    parser.add_argument(
-        "--log_tracker_config",
-        type=str,
-        default=None,
-        help="path to tracker config file to use for logging / ログ出力に使用するtrackerの設定ファイルのパス",
     )
     parser.add_argument(
         "--wandb_api_key",
@@ -2756,11 +2476,6 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         type=float,
         default=None,
         help="add `latent mean absolute value * this value` to noise_offset (disabled if None, default) / latentの平均値の絶対値 * この値をnoise_offsetに加算する（Noneの場合は無効、デフォルト）",
-    )
-    parser.add_argument(
-        "--zero_terminal_snr",
-        action="store_true",
-        help="fix noise scheduler betas to enforce zero terminal SNR / noise schedulerのbetasを修正して、zero terminal SNRを強制する",
     )
     parser.add_argument(
         "--min_timestep",
@@ -2837,7 +2552,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
 
 def verify_training_args(args: argparse.Namespace):
     if args.v_parameterization and not args.v2:
-        print("v_parameterization should be with v2 not v1 or sdxl / v1やsdxlでv_parameterizationを使用することは想定されていません")
+        print("v_parameterization should be with v2 / v1でv_parameterizationを使用することは想定されていません")
     if args.v2 and args.clip_skip is not None:
         print("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
 
@@ -2866,12 +2581,6 @@ def verify_training_args(args: argparse.Namespace):
     if args.scale_v_pred_loss_like_noise_pred and not args.v_parameterization:
         raise ValueError(
             "scale_v_pred_loss_like_noise_pred can be enabled only with v_parameterization / scale_v_pred_loss_like_noise_predはv_parameterizationが有効なときのみ有効にできます"
-        )
-
-    if args.zero_terminal_snr and not args.v_parameterization:
-        print(
-            f"zero_terminal_snr is enabled, but v_parameterization is not enabled. training will be unexpected"
-            + " / zero_terminal_snrが有効ですが、v_parameterizationが有効ではありません。学習結果は想定外になる可能性があります"
         )
 
 
@@ -3234,7 +2943,7 @@ def get_optimizer(args, trainable_params):
     elif optimizer_type == "SGDNesterov".lower():
         print(f"use SGD with Nesterov optimizer | {optimizer_kwargs}")
         if "momentum" not in optimizer_kwargs:
-            print(f"SGD with Nesterov must be with momentum, set momentum to 0.9 / SGD with Nesterovはmomentum指定が必須のため0.9に設定します")
+            print("SGD with Nesterov must be with momentum, set momentum to 0.9 / SGD with Nesterovはmomentum指定が必須のため0.9に設定します")
             optimizer_kwargs["momentum"] = 0.9
 
         optimizer_class = torch.optim.SGD
@@ -3391,7 +3100,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     """
     name = args.lr_scheduler
     num_warmup_steps: Optional[int] = args.lr_warmup_steps
-    num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
+    num_training_steps = args.max_train_steps * num_processes * args.gradient_accumulation_steps
     num_cycles = args.lr_scheduler_num_cycles
     power = args.lr_scheduler_power
 
@@ -3558,6 +3267,7 @@ def prepare_accelerator(args: argparse.Namespace):
         mixed_precision=args.mixed_precision,
         log_with=log_with,
         project_dir=logging_dir,
+        even_batches=False
     )
     return accelerator
 
@@ -3719,62 +3429,6 @@ def get_hidden_states(args: argparse.Namespace, input_ids, tokenizer, text_encod
         encoder_hidden_states = encoder_hidden_states.to(weight_dtype)
 
     return encoder_hidden_states
-
-
-def get_hidden_states_sdxl(
-    max_token_length, input_ids1, input_ids2, tokenizer1, tokenizer2, text_encoder1, text_encoder2, weight_dtype=None
-):
-    # input_ids: b,n,77 -> b*n, 77
-    b_size = input_ids1.size()[0]
-    input_ids1 = input_ids1.reshape((-1, tokenizer1.model_max_length))  # batch_size*n, 77
-    input_ids2 = input_ids2.reshape((-1, tokenizer2.model_max_length))  # batch_size*n, 77
-
-    # text_encoder1
-    enc_out = text_encoder1(input_ids1, output_hidden_states=True, return_dict=True)
-    hidden_states1 = enc_out["hidden_states"][11]
-
-    # text_encoder2
-    enc_out = text_encoder2(input_ids2, output_hidden_states=True, return_dict=True)
-    hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
-    pool2 = enc_out["text_embeds"]
-
-    # b*n, 77, 768 or 1280 -> b, n*77, 768 or 1280
-    n_size = 1 if max_token_length is None else max_token_length // 75
-    hidden_states1 = hidden_states1.reshape((b_size, -1, hidden_states1.shape[-1]))
-    hidden_states2 = hidden_states2.reshape((b_size, -1, hidden_states2.shape[-1]))
-
-    if max_token_length is not None:
-        # bs*3, 77, 768 or 1024
-        # encoder1: <BOS>...<EOS> の三連を <BOS>...<EOS> へ戻す
-        states_list = [hidden_states1[:, 0].unsqueeze(1)]  # <BOS>
-        for i in range(1, max_token_length, tokenizer1.model_max_length):
-            states_list.append(hidden_states1[:, i : i + tokenizer1.model_max_length - 2])  # <BOS> の後から <EOS> の前まで
-        states_list.append(hidden_states1[:, -1].unsqueeze(1))  # <EOS>
-        hidden_states1 = torch.cat(states_list, dim=1)
-
-        # v2: <BOS>...<EOS> <PAD> ... の三連を <BOS>...<EOS> <PAD> ... へ戻す　正直この実装でいいのかわからん
-        states_list = [hidden_states2[:, 0].unsqueeze(1)]  # <BOS>
-        for i in range(1, max_token_length, tokenizer2.model_max_length):
-            chunk = hidden_states2[:, i : i + tokenizer2.model_max_length - 2]  # <BOS> の後から 最後の前まで
-            # this causes an error:
-            # RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation
-            # if i > 1:
-            #     for j in range(len(chunk)):  # batch_size
-            #         if input_ids2[n_index + j * n_size, 1] == tokenizer2.eos_token_id:  # 空、つまり <BOS> <EOS> <PAD> ...のパターン
-            #             chunk[j, 0] = chunk[j, 1]  # 次の <PAD> の値をコピーする
-            states_list.append(chunk)  # <BOS> の後から <EOS> の前まで
-        states_list.append(hidden_states2[:, -1].unsqueeze(1))  # <EOS> か <PAD> のどちらか
-        hidden_states2 = torch.cat(states_list, dim=1)
-
-        # pool はnの最初のものを使う
-        pool2 = pool2[::n_size]
-
-    if weight_dtype is not None:
-        # this is required for additional network training
-        hidden_states1 = hidden_states1.to(weight_dtype)
-        hidden_states2 = hidden_states2.to(weight_dtype)
-
-    return hidden_states1, hidden_states2, pool2
 
 
 def default_if_none(value, default):
@@ -4217,98 +3871,97 @@ def sample_images_common(
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
     with torch.no_grad():
-        # with accelerator.autocast():
-        for i, prompt in enumerate(prompts):
-            if not accelerator.is_main_process:
-                continue
+        with accelerator.autocast():
+            for i, prompt in enumerate(prompts):
+                if not accelerator.is_main_process:
+                    continue
 
-            if isinstance(prompt, dict):
-                negative_prompt = prompt.get("negative_prompt")
-                sample_steps = prompt.get("sample_steps", 30)
-                width = prompt.get("width", 512)
-                height = prompt.get("height", 512)
-                scale = prompt.get("scale", 7.5)
-                seed = prompt.get("seed")
-                controlnet_image = prompt.get("controlnet_image")
-                prompt = prompt.get("prompt")
-            else:
-                # prompt = prompt.strip()
-                # if len(prompt) == 0 or prompt[0] == "#":
-                #     continue
+                if isinstance(prompt, dict):
+                    negative_prompt = prompt.get("negative_prompt")
+                    sample_steps = prompt.get("sample_steps", 30)
+                    width = prompt.get("width", 512)
+                    height = prompt.get("height", 512)
+                    scale = prompt.get("scale", 7.5)
+                    seed = prompt.get("seed")
+                    controlnet_image = prompt.get("controlnet_image")
+                    prompt = prompt.get("prompt")
+                else:
+                    # prompt = prompt.strip()
+                    # if len(prompt) == 0 or prompt[0] == "#":
+                    #     continue
 
-                # subset of gen_img_diffusers
-                prompt_args = prompt.split(" --")
-                prompt = prompt_args[0]
-                negative_prompt = None
-                sample_steps = 30
-                width = height = 512
-                scale = 7.5
-                seed = None
-                controlnet_image = None
-                for parg in prompt_args:
-                    try:
-                        m = re.match(r"w (\d+)", parg, re.IGNORECASE)
-                        if m:
-                            width = int(m.group(1))
-                            continue
+                    # subset of gen_img_diffusers
+                    prompt_args = prompt.split(" --")
+                    prompt = prompt_args[0]
+                    negative_prompt = None
+                    sample_steps = 30
+                    width = height = 512
+                    scale = 7.5
+                    seed = None
+                    controlnet_image = None
+                    for parg in prompt_args:
+                        try:
+                            m = re.match(r"w (\d+)", parg, re.IGNORECASE)
+                            if m:
+                                width = int(m.group(1))
+                                continue
 
-                        m = re.match(r"h (\d+)", parg, re.IGNORECASE)
-                        if m:
-                            height = int(m.group(1))
-                            continue
+                            m = re.match(r"h (\d+)", parg, re.IGNORECASE)
+                            if m:
+                                height = int(m.group(1))
+                                continue
 
-                        m = re.match(r"d (\d+)", parg, re.IGNORECASE)
-                        if m:
-                            seed = int(m.group(1))
-                            continue
+                            m = re.match(r"d (\d+)", parg, re.IGNORECASE)
+                            if m:
+                                seed = int(m.group(1))
+                                continue
 
-                        m = re.match(r"s (\d+)", parg, re.IGNORECASE)
-                        if m:  # steps
-                            sample_steps = max(1, min(1000, int(m.group(1))))
-                            continue
+                            m = re.match(r"s (\d+)", parg, re.IGNORECASE)
+                            if m:  # steps
+                                sample_steps = max(1, min(1000, int(m.group(1))))
+                                continue
 
-                        m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
-                        if m:  # scale
-                            scale = float(m.group(1))
-                            continue
+                            m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
+                            if m:  # scale
+                                scale = float(m.group(1))
+                                continue
 
-                        m = re.match(r"n (.+)", parg, re.IGNORECASE)
-                        if m:  # negative prompt
-                            negative_prompt = m.group(1)
-                            continue
+                            m = re.match(r"n (.+)", parg, re.IGNORECASE)
+                            if m:  # negative prompt
+                                negative_prompt = m.group(1)
+                                continue
 
-                        m = re.match(r"cn (.+)", parg, re.IGNORECASE)
-                        if m:  # negative prompt
-                            controlnet_image = m.group(1)
-                            continue
+                            m = re.match(r"cn (.+)", parg, re.IGNORECASE)
+                            if m:  # negative prompt
+                                controlnet_image = m.group(1)
+                                continue
 
-                    except ValueError as ex:
-                        print(f"Exception in parsing / 解析エラー: {parg}")
-                        print(ex)
+                        except ValueError as ex:
+                            print(f"Exception in parsing / 解析エラー: {parg}")
+                            print(ex)
 
-            if seed is not None:
-                torch.manual_seed(seed)
-                torch.cuda.manual_seed(seed)
+                if seed is not None:
+                    torch.manual_seed(seed)
+                    torch.cuda.manual_seed(seed)
 
-            if prompt_replacement is not None:
-                prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
-                if negative_prompt is not None:
-                    negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
+                if prompt_replacement is not None:
+                    prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
+                    if negative_prompt is not None:
+                        negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
-            if controlnet_image is not None:
-                controlnet_image = Image.open(controlnet_image).convert("RGB")
-                controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
+                if controlnet_image is not None:
+                    controlnet_image = Image.open(controlnet_image).convert("RGB")
+                    controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
 
-            height = max(64, height - height % 8)  # round to divisible by 8
-            width = max(64, width - width % 8)  # round to divisible by 8
-            print(f"prompt: {prompt}")
-            print(f"negative_prompt: {negative_prompt}")
-            print(f"height: {height}")
-            print(f"width: {width}")
-            print(f"sample_steps: {sample_steps}")
-            print(f"scale: {scale}")
-            with accelerator.autocast():
-                latents = pipeline(
+                height = max(64, height - height % 8)  # round to divisible by 8
+                width = max(64, width - width % 8)  # round to divisible by 8
+                print(f"prompt: {prompt}")
+                print(f"negative_prompt: {negative_prompt}")
+                print(f"height: {height}")
+                print(f"width: {width}")
+                print(f"sample_steps: {sample_steps}")
+                print(f"scale: {scale}")
+                image = pipeline(
                     prompt=prompt,
                     height=height,
                     width=width,
@@ -4317,30 +3970,28 @@ def sample_images_common(
                     negative_prompt=negative_prompt,
                     controlnet=controlnet,
                     controlnet_image=controlnet_image,
+                ).images[0]
+
+                ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+                num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+                seed_suffix = "" if seed is None else f"_{seed}"
+                img_filename = (
+                    f"{'' if args.output_name is None else args.output_name + '_'}{ts_str}_{num_suffix}_{i:02d}{seed_suffix}.png"
                 )
 
-            image = pipeline.latents_to_image(latents)[0]
+                image.save(os.path.join(save_dir, img_filename))
 
-            ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-            num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
-            seed_suffix = "" if seed is None else f"_{seed}"
-            img_filename = (
-                f"{'' if args.output_name is None else args.output_name + '_'}{ts_str}_{num_suffix}_{i:02d}{seed_suffix}.png"
-            )
-
-            image.save(os.path.join(save_dir, img_filename))
-
-            # wandb有効時のみログを送信
-            try:
-                wandb_tracker = accelerator.get_tracker("wandb")
+                # wandb有効時のみログを送信
                 try:
-                    import wandb
-                except ImportError:  # 事前に一度確認するのでここはエラー出ないはず
-                    raise ImportError("No wandb / wandb がインストールされていないようです")
+                    wandb_tracker = accelerator.get_tracker("wandb")
+                    try:
+                        import wandb
+                    except ImportError:  # 事前に一度確認するのでここはエラー出ないはず
+                        raise ImportError("No wandb / wandb がインストールされていないようです")
 
-                wandb_tracker.log({f"sample_{i}": wandb.Image(image)})
-            except:  # wandb 無効時
-                pass
+                    wandb_tracker.log({f"sample_{i}": wandb.Image(image)})
+                except Exception:  # wandb 無効時
+                    pass
 
     # clear pipeline and cache to reduce vram usage
     del pipeline

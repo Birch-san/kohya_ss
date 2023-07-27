@@ -31,7 +31,7 @@ class AdvancedTraining:
             )
             self.vae = gr.Textbox(
                 label='VAE',
-                placeholder='(Optional) path to checkpoint of vae to replace for training',
+                placeholder='(Optiona) path to checkpoint of vae to replace for training',
             )
             self.vae_button = gr.Button(
                 '📂', elem_id='open_folder_small', visible=(not headless)
@@ -40,6 +40,16 @@ class AdvancedTraining:
                 get_any_file_path,
                 outputs=self.vae,
                 show_progress=False,
+            )
+        with gr.Row(visible=not finetuning):
+            self.lr_scheduler_num_cycles = gr.Textbox(
+                label='LR number of cycles',
+                placeholder='(Optional) For Cosine with restart and polynomial only',
+            )
+
+            self.lr_scheduler_power = gr.Textbox(
+                label='LR power',
+                placeholder='(Optional) For Cosine with restart and polynomial only',
             )
 
         with gr.Row():
@@ -61,7 +71,7 @@ class AdvancedTraining:
                 info='(Optional) Save only the specified number of models (old models will be deleted)',
             )
             self.save_last_n_steps_state = gr.Number(
-                label='Save last N steps state',
+                label='Save last N states',
                 value=0,
                 precision=0,
                 info='(Optional) Save only the specified number of states (old models will be deleted)',
@@ -208,10 +218,10 @@ class AdvancedTraining:
                 outputs=self.resume,
                 show_progress=False,
             )
-            # self.max_train_epochs = gr.Textbox(
-            #     label='Max train epoch',
-            #     placeholder='(Optional) Override number of epoch',
-            # )
+            self.max_train_epochs = gr.Textbox(
+                label='Max train epoch',
+                placeholder='(Optional) Override number of epoch',
+            )
             self.max_data_loader_n_workers = gr.Textbox(
                 label='Max num workers for DataLoader',
                 placeholder='(Optional) Override number of epoch. Default: 8',

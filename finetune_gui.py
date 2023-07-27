@@ -24,7 +24,6 @@ from library.class_source_model import SourceModel
 from library.class_basic_training import BasicTraining
 from library.class_advanced_training import AdvancedTraining
 from library.class_sdxl_parameters import SDXLParameters
-from library.class_command_executor import CommandExecutor
 from library.tensorboard_gui import (
     gradio_tensorboard,
     start_tensorboard,
@@ -37,9 +36,6 @@ from library.custom_logging import setup_logging
 
 # Set up logging
 log = setup_logging()
-
-# Setup command executor
-executor = CommandExecutor()
 
 # from easygui import msgbox
 
@@ -82,7 +78,6 @@ def save_configuration(
     seed,
     num_cpu_threads_per_process,
     train_text_encoder,
-    full_bf16,
     create_caption,
     create_buckets,
     save_model_as,
@@ -202,7 +197,6 @@ def open_configuration(
     seed,
     num_cpu_threads_per_process,
     train_text_encoder,
-    full_bf16,
     create_caption,
     create_buckets,
     save_model_as,
@@ -319,7 +313,6 @@ def train_model(
     seed,
     num_cpu_threads_per_process,
     train_text_encoder,
-    full_bf16,
     generate_caption_database,
     generate_image_buckets,
     save_model_as,
@@ -423,8 +416,13 @@ def train_model(
             run_cmd += f' --full_path'
 
         log.info(run_cmd)
-        
-        executor.execute_command(run_cmd=run_cmd)
+
+        if not print_only_bool:
+            # Run the command
+            if os.name == 'posix':
+                os.system(run_cmd)
+            else:
+                subprocess.run(run_cmd)
 
     # create images buckets
     if generate_image_buckets:
@@ -447,7 +445,10 @@ def train_model(
 
         if not print_only_bool:
             # Run the command
-            executor.execute_command(run_cmd=run_cmd)
+            if os.name == 'posix':
+                os.system(run_cmd)
+            else:
+                subprocess.run(run_cmd)
 
     image_num = len(
         [
@@ -494,8 +495,6 @@ def train_model(
         run_cmd += ' --v_parameterization'
     if train_text_encoder:
         run_cmd += ' --train_text_encoder'
-    if full_bf16:
-        run_cmd += ' --full_bf16'
     if weighted_captions:
         run_cmd += ' --weighted_captions'
     run_cmd += (
@@ -621,7 +620,10 @@ def train_model(
         log.info(run_cmd)
 
         # Run the command
-        executor.execute_command(run_cmd=run_cmd)
+        if os.name == 'posix':
+            os.system(run_cmd)
+        else:
+            subprocess.run(run_cmd)
 
         # check if output_dir/last is a folder... therefore it is a diffuser model
         last_dir = pathlib.Path(f'{output_dir}/{output_name}')
@@ -786,9 +788,6 @@ def finetune_tab(headless=False):
                 train_text_encoder = gr.Checkbox(
                     label='Train text encoder', value=True
                 )
-                full_bf16 = gr.Checkbox(
-                    label='Full bf16', value = False
-                )
             with gr.Accordion('Advanced parameters', open=False):
                 with gr.Row():
                     gradient_accumulation_steps = gr.Number(
@@ -803,10 +802,7 @@ def finetune_tab(headless=False):
 
             sample = SampleImages()
 
-        with gr.Row():
-            button_run = gr.Button('Start training', variant='primary')
-            
-            button_stop_training = gr.Button('Stop training')
+        button_run = gr.Button('Train model', variant='primary')
 
         button_print = gr.Button('Print training command')
 
@@ -852,7 +848,6 @@ def finetune_tab(headless=False):
             basic_training.seed,
             basic_training.num_cpu_threads_per_process,
             train_text_encoder,
-            full_bf16,
             create_caption,
             create_buckets,
             source_model.save_model_as,
@@ -867,7 +862,7 @@ def finetune_tab(headless=False):
             advanced_training.shuffle_caption,
             output_name,
             advanced_training.max_token_length,
-            basic_training.max_train_epochs,
+            advanced_training.max_train_epochs,
             advanced_training.max_data_loader_n_workers,
             advanced_training.full_fp16,
             advanced_training.color_aug,
@@ -913,10 +908,6 @@ def finetune_tab(headless=False):
             train_model,
             inputs=[dummy_headless] + [dummy_db_false] + settings_list,
             show_progress=False,
-        )
-        
-        button_stop_training.click(
-            executor.kill_command
         )
 
         button_print.click(

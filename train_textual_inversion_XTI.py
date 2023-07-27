@@ -234,7 +234,7 @@ def train(args):
 
     # make captions: tokenstring tokenstring1 tokenstring2 ...tokenstringn という文字列に書き換える超乱暴な実装
     if use_template:
-        print(f"use template for training captions. is object: {args.use_object_template}")
+        print("use template for training captions. is object: {args.use_object_template}")
         templates = imagenet_templates_small if args.use_object_template else imagenet_style_templates_small
         replace_to = " ".join(token_strings)
         captions = []
@@ -384,14 +384,9 @@ def train(args):
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
     )
     prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
-    if args.zero_terminal_snr:
-        custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
 
     if accelerator.is_main_process:
-        init_kwargs = {}
-        if args.log_tracker_config is not None:
-            init_kwargs = toml.load(args.log_tracker_config)
-        accelerator.init_trackers("textual_inversion" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs)
+        accelerator.init_trackers("textual_inversion" if args.log_tracker_name is None else args.log_tracker_name)
 
     # function for saving/removing
     def save_model(ckpt_name, embs, steps, epoch_no, force_sync_upload=False):

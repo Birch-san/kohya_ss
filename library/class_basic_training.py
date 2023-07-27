@@ -23,10 +23,6 @@ class BasicTraining:
                 step=1,
             )
             self.epoch = gr.Number(label='Epoch', value=1, precision=0)
-            self.max_train_epochs = gr.Textbox(
-                label='Max train epoch',
-                placeholder='(Optional) Enforce number of epoch',
-            )
             self.save_every_n_epochs = gr.Number(
                 label='Save every N epochs', value=1, precision=0
             )
@@ -114,16 +110,6 @@ class BasicTraining:
                 value='AdamW8bit',
                 interactive=True,
             )
-        with gr.Row(visible=not finetuning):
-            self.lr_scheduler_num_cycles = gr.Textbox(
-                label='LR number of cycles',
-                placeholder='(Optional) For Cosine with restart and polynomial only',
-            )
-
-            self.lr_scheduler_power = gr.Textbox(
-                label='LR power',
-                placeholder='(Optional) For Cosine with restart and polynomial only',
-            )
         with gr.Row():
             self.optimizer_args = gr.Textbox(
                 label='Optimizer extra arguments',
@@ -142,8 +128,4 @@ class BasicTraining:
                 step=1,
                 label='Stop text encoder training',
             )
-        with gr.Row(visible=not finetuning):
             self.enable_bucket = gr.Checkbox(label='Enable buckets', value=True)
-            self.min_bucket_reso = gr.Slider(label='Minimum bucket resolution', value=256, minimum=64, maximum=4096, step=64, info='Minimum size in pixel a bucket can be (>= 64)')
-            self.max_bucket_reso = gr.Slider(label='Maximum bucket resolution', value=2048, minimum=64, maximum=4096, step=64, info='Maximum size in pixel a bucket can be (>= 64)')
-            

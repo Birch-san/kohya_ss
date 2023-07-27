@@ -1,0 +1,45 @@
+# Model settings
+pretrained_model_name_or_path = "/mnt/wd-dataset/base.safetensors"
+
+# Dataset config - mostly ignored due to custom dataset module
+train_data_dir = "null"
+train_batch_size = 4
+max_train_epochs = 25
+max_data_loader_n_workers = 4
+
+# Training settings
+seed = 420                       # nice
+gradient_checkpointing = true
+gradient_accumulation_steps = 12
+train_text_encoder = false
+noise_offset = 0.0357            # needed for SDXL 0.9, not sure if 1.0 needs it
+
+# Optimization/speed settings
+xformers = true
+mixed_precision = "no"
+learning_rate = 5e-6
+
+# Optimizer settings
+optimizer_type = "AdaFactor"
+optimizer_args = [
+    "scale_parameter=False",
+    "relative_step=False",
+    "warmup_init=False",
+]
+lr_scheduler = "adafactor:5e-6"
+lr_warmup_steps = 0
+
+# Sampling/Logging settings
+sample_every_n_steps = 10000000 # basically never
+log_with = "wandb"
+log_tracker_name = "wdxl"
+
+
+# Saving settings
+save_model_as = "safetensors"
+save_precision = "fp32"
+output_dir = "/mnt/wd-dataset/wdxl-final-2"
+output_name = "wdxl"
+save_every_n_steps = 2000
+save_last_n_epochs_state = 1
+save_state = true

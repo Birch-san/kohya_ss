@@ -185,14 +185,14 @@ def get_prompts_with_weights(pipe: StableDiffusionPipeline, prompt: List[str], m
     return tokens, weights
 
 
-def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, pad, no_boseos_middle=True, chunk_length=77):
+def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, no_boseos_middle=True, chunk_length=77):
     r"""
     Pad the tokens (with starting and ending tokens) and weights (with 1.0) to max_length.
     """
     max_embeddings_multiples = (max_length - 2) // (chunk_length - 2)
     weights_length = max_length if no_boseos_middle else max_embeddings_multiples * chunk_length
     for i in range(len(tokens)):
-        tokens[i] = [bos] + tokens[i] + [eos] + [pad] * (max_length - 2 - len(tokens[i]))
+        tokens[i] = [bos] + tokens[i] + [eos] * (max_length - 1 - len(tokens[i]))
         if no_boseos_middle:
             weights[i] = [1.0] + weights[i] + [1.0] * (max_length - 1 - len(weights[i]))
         else:
@@ -285,7 +285,7 @@ def get_unweighted_text_embeddings(
 
 
 def get_weighted_text_embeddings(
-    pipe,  # : SdxlStableDiffusionLongPromptWeightingPipeline,
+    pipe: StableDiffusionPipeline,
     prompt: Union[str, List[str]],
     uncond_prompt: Optional[Union[str, List[str]]] = None,
     max_embeddings_multiples: Optional[int] = 3,
@@ -363,7 +363,6 @@ def get_weighted_text_embeddings(
         max_length,
         bos,
         eos,
-        pad,
         no_boseos_middle=no_boseos_middle,
         chunk_length=pipe.tokenizer.model_max_length,
     )
@@ -375,7 +374,6 @@ def get_weighted_text_embeddings(
             max_length,
             bos,
             eos,
-            pad,
             no_boseos_middle=no_boseos_middle,
             chunk_length=pipe.tokenizer.model_max_length,
         )
@@ -657,9 +655,11 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
                 uncond_pool = uncond_pool.repeat(1, num_images_per_prompt)
                 uncond_pool = uncond_pool.view(bs_embed * num_images_per_prompt, -1)
 
-            return text_embeddings, text_pool, uncond_embeddings, uncond_pool
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            if text_pool is not None:
+                text_pool = torch.cat([uncond_pool, text_pool])
 
-        return text_embeddings, text_pool, None, None
+        return text_embeddings, text_pool
 
     def check_inputs(self, prompt, height, width, strength, callback_steps):
         if not isinstance(prompt, str) and not isinstance(prompt, list):
@@ -669,6 +669,7 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             raise ValueError(f"The value of strength should in [0.0, 1.0] but is {strength}")
 
         if height % 8 != 0 or width % 8 != 0:
+            print(height, width)
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
         if (callback_steps is None) or (
@@ -710,7 +711,7 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             # self.vae.set_use_memory_efficient_attention_xformers(False)
             # image = self.vae.decode(latents.to("cpu")).sample
 
-            image = self.vae.decode(latents.to(self.vae.dtype)).sample
+            image = self.vae.decode(latents).sample
             image = (image / 2 + 0.5).clamp(0, 1)
             # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
             image = image.cpu().permute(0, 2, 3, 1).float().numpy()
@@ -898,14 +899,12 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         # 実装を簡単にするためにtokenzer/text encoderを切り替えて二回呼び出す
         # To simplify the implementation, switch the tokenzer/text encoder and call it twice
         text_embeddings_list = []
-        text_pool = None
-        uncond_embeddings_list = []
-        uncond_pool = None
+        text_pools = []
         for i in range(len(self.tokenizers)):
             self.tokenizer = self.tokenizers[i]
             self.text_encoder = self.text_encoders[i]
 
-            text_embeddings, tp1, uncond_embeddings, up1 = self._encode_prompt(
+            text_embeddings, text_pool = self._encode_prompt(
                 prompt,
                 device,
                 num_images_per_prompt,
@@ -915,14 +914,9 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
                 is_sdxl_text_encoder2=i == 1,
             )
             text_embeddings_list.append(text_embeddings)
-            uncond_embeddings_list.append(uncond_embeddings)
+            text_pools.append(text_pool)
 
-            if tp1 is not None:
-                text_pool = tp1
-            if up1 is not None:
-                uncond_pool = up1
-
-        dtype = self.unet.dtype
+        dtype = text_embeddings_list[0].dtype
 
         # 4. Preprocess image and mask
         if isinstance(image, PIL.Image.Image):
@@ -969,19 +963,11 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         crop_size = torch.zeros_like(orig_size)
         target_size = orig_size
         embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(dtype)
-
-        # make conditionings
         if do_classifier_free_guidance:
-            text_embeddings = torch.cat(text_embeddings_list, dim=2)
-            uncond_embeddings = torch.cat(uncond_embeddings_list, dim=2)
-            text_embedding = torch.cat([uncond_embeddings, text_embeddings]).to(dtype)
+            embs = torch.cat([embs] * 2)
 
-            cond_vector = torch.cat([text_pool, embs], dim=1)
-            uncond_vector = torch.cat([uncond_pool, embs], dim=1)
-            vector_embedding = torch.cat([uncond_vector, cond_vector]).to(dtype)
-        else:
-            text_embedding = torch.cat(text_embeddings_list, dim=2).to(dtype)
-            vector_embedding = torch.cat([text_pool, embs], dim=1).to(dtype)
+        vector_embedding = torch.cat([text_pools[1], embs], dim=1).to(dtype)
+        text_embedding = torch.cat(text_embeddings_list, dim=2).to(dtype)
 
         # 8. Denoising loop
         for i, t in enumerate(self.progress_bar(timesteps)):
@@ -1005,7 +991,6 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
 
             # predict the noise residual
             noise_pred = self.unet(latent_model_input, t, text_embedding, vector_embedding)
-            noise_pred = noise_pred.to(dtype)  # U-Net changes dtype in LoRA training
 
             # perform guidance
             if do_classifier_free_guidance:
@@ -1027,13 +1012,20 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
                 if is_cancelled_callback is not None and is_cancelled_callback():
                     return None
 
-        return latents
-
-    def latents_to_image(self, latents):
         # 9. Post-processing
-        image = self.decode_latents(latents.to(self.vae.dtype))
-        image = self.numpy_to_pil(image)
-        return image
+        image = self.decode_latents(latents.to(torch.float32))
+
+        # 10. Run safety checker
+        image, has_nsfw_concept = image, None  #  self.run_safety_checker(image, device, text_embeddings.dtype)
+
+        # 11. Convert to PIL
+        if output_type == "pil":
+            image = self.numpy_to_pil(image)
+
+        if not return_dict:
+            return image, has_nsfw_concept
+
+        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
     # copy from pil_utils.py
     def numpy_to_pil(self, images: np.ndarray) -> Image.Image:

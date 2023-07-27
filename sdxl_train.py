@@ -1,11 +1,15 @@
 # training with captions
 
+from PIL import Image
+import io
+from collections.abc import Iterable
+import random
 import argparse
 import gc
 import math
+import torchvision
 import os
 from multiprocessing import Value
-import toml
 
 from tqdm import tqdm
 import torch
@@ -30,6 +34,16 @@ from library.custom_train_functions import (
 )
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
+from store import AspectBucket, ImageStore, AspectDataset, AspectBucketSampler
+
+Image.MAX_IMAGE_PIXELS = None
+
+image_transforms = torchvision.transforms.Compose(
+    [
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize([0.5], [0.5]),
+    ]
+)
 
 def train(args):
     train_util.verify_training_args(args)
@@ -49,74 +63,10 @@ def train(args):
 
     tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
 
-    # データセットを準備する
-    if args.dataset_class is None:
-        blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, False, True))
-        if args.dataset_config is not None:
-            print(f"Load dataset config from {args.dataset_config}")
-            user_config = config_util.load_user_config(args.dataset_config)
-            ignored = ["train_data_dir", "in_json"]
-            if any(getattr(args, attr) is not None for attr in ignored):
-                print(
-                    "ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(
-                        ", ".join(ignored)
-                    )
-                )
-        else:
-            if use_dreambooth_method:
-                print("Using DreamBooth method.")
-                user_config = {
-                    "datasets": [
-                        {
-                            "subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(
-                                args.train_data_dir, args.reg_data_dir
-                            )
-                        }
-                    ]
-                }
-            else:
-                print("Training with captions.")
-                user_config = {
-                    "datasets": [
-                        {
-                            "subsets": [
-                                {
-                                    "image_dir": args.train_data_dir,
-                                    "metadata_file": args.in_json,
-                                }
-                            ]
-                        }
-                    ]
-                }
-
-        blueprint = blueprint_generator.generate(user_config, args, tokenizer=[tokenizer1, tokenizer2])
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-    else:
-        train_dataset_group = train_util.load_arbitrary_dataset(args, [tokenizer1, tokenizer2])
+    tokenizer2("fuck", padding="max_length", truncation=True, max_length=77, return_tensors='pt')
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
-    ds_for_collater = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-    collater = train_util.collater_class(current_epoch, current_step, ds_for_collater)
-
-    if args.debug_dataset:
-        train_util.debug_dataset(train_dataset_group, True)
-        return
-    if len(train_dataset_group) == 0:
-        print(
-            "No data found. Please verify the metadata file and train_data_dir option. / 画像がありません。メタデータおよびtrain_data_dirオプションを確認してください。"
-        )
-        return
-
-    if cache_latents:
-        assert (
-            train_dataset_group.is_latent_cacheable()
-        ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
-
-    if args.cache_text_encoder_outputs:
-        assert (
-            train_dataset_group.is_text_encoder_output_cacheable()
-        ), "when caching text encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / text encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
 
     # acceleratorを準備する
     print("prepare accelerator")
@@ -172,25 +122,10 @@ def train(args):
         # set_diffusers_xformers_flag(unet, True)
         set_diffusers_xformers_flag(vae, True)
     else:
-        # Windows版のxformersはfloatで学習できなかったりするのでxformersを使わない設定も可能にしておく必要がある
+        # Windows版のxformersはfloatで学習できなかったりxformersを使わない設定も可能にしておく必要がある
         accelerator.print("Disable Diffusers' xformers")
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
-        if torch.__version__ >= "2.0.0": # PyTorch 2.0.0 以上対応のxformersなら以下が使える
-            vae.set_use_memory_efficient_attention_xformers(args.xformers)
-
-    # 学習を準備する
-    if cache_latents:
-        vae.to(accelerator.device, dtype=vae_dtype)
-        vae.requires_grad_(False)
-        vae.eval()
-        with torch.no_grad():
-            train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
-        vae.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        accelerator.wait_for_everyone()
+        vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
     # 学習を準備する：モデルを適切な状態にする
     training_models = []
@@ -206,26 +141,11 @@ def train(args):
             text_encoder2.gradient_checkpointing_enable()
         training_models.append(text_encoder1)
         training_models.append(text_encoder2)
-        # set require_grad=True later
     else:
         text_encoder1.requires_grad_(False)
         text_encoder2.requires_grad_(False)
         text_encoder1.eval()
         text_encoder2.eval()
-
-        # TextEncoderの出力をキャッシュする
-        if args.cache_text_encoder_outputs:
-            # Text Encodes are eval and no grad
-            with torch.no_grad():
-                train_dataset_group.cache_text_encoder_outputs(
-                    (tokenizer1, tokenizer2),
-                    (text_encoder1, text_encoder2),
-                    accelerator.device,
-                    None,
-                    args.cache_text_encoder_outputs_to_disk,
-                    accelerator.is_main_process,
-                )
-            accelerator.wait_for_everyone()
 
     if not cache_latents:
         vae.requires_grad_(False)
@@ -253,42 +173,74 @@ def train(args):
     # dataloaderを準備する
     # DataLoaderのプロセス数：0はメインプロセスになる
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count() - 1)  # cpu_count-1 ただし最大で指定された数まで
+    bucket = AspectBucket(ImageStore(), args.train_batch_size)
+    dataset = AspectDataset(bucket)
+    sampler = AspectBucketSampler(bucket=bucket, dataset=dataset)
+
+    def drop_random(data):
+        if not isinstance(data, Iterable):
+            return ''
+        if random.random() > 0.1:
+            x = random.randint(0, 100)
+            if x >= 50:
+                return ', '.join(data)
+            else:
+                return ', '.join(data[:len(data) * x * 2 // 100])
+            return ', '.join(data)
+        else:
+            # drop for unconditional guidance
+            return ''
+
+    def is_valid_image(image_bytes):
+        try:
+            Image.open(io.BytesIO(image_bytes))
+            return True
+        except Exception:
+            return False
+
+    def collate_fn(examples):
+        valid_examples = []
+        for i in range(len(examples)):
+            if examples[i][0] is not None or is_valid_image(examples[i][0]):
+                valid_examples.append(examples[i])
+            else:
+                if valid_examples:
+                    examples[i] = random.choice(valid_examples)
+                else:
+                    return {"error": "YOU FUCKED UP!!!!!!! KILL YOURSELF NOW! YOU SERVE ZERO PURPOSE! YOUR LIFE IS AS VALUABLE AS A SUMMER ANT. IM GONNA KEEP STOMPIN YOU AND YOU ARE GONNA KEEP COMIN BACK AND IM GONNA SEAL UP ALL MY CRACKS AND YOU ARE GONNA KEEP COMIN BACK. YOU WANNA KNOW WHY? CUZ YOU KEEP SMELLIN THE SYRUP"}
+        return_dict = {
+            "latents": [example[0] for example in examples],
+            "input_ids": [tokenizer1(drop_random(example[1]), padding="max_length", truncation=True, max_length=77, return_tensors='pt').input_ids for example in examples],
+            "input_ids2": [tokenizer2(drop_random(example[1]), padding="max_length", truncation=True, max_length=77, return_tensors='pt').input_ids for example in examples],
+            "original_sizes_hw": torch.stack([torch.LongTensor(example[4]) for example in examples]),
+            "crop_top_lefts": torch.stack([torch.LongTensor(example[6]) for example in examples]),
+            "target_sizes_hw": torch.stack([torch.LongTensor(example[5]) for example in examples]),
+            "source_name": [example[2] for example in examples],
+            "source_id": [example[3] for example in examples]
+        }
+        return return_dict
+
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset_group,
-        batch_size=1,
-        shuffle=True,
-        collate_fn=collater,
-        num_workers=n_workers,
-        persistent_workers=args.persistent_data_loader_workers,
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=collate_fn,
+        num_workers=args.max_data_loader_n_workers,
     )
 
-    # 学習ステップ数を計算する
-    if args.max_train_epochs is not None:
-        args.max_train_steps = args.max_train_epochs * math.ceil(
-            len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
-        )
-        accelerator.print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
-
-    # データセット側にも学習ステップを送信
-    train_dataset_group.set_max_train_steps(args.max_train_steps)
+    args.max_train_steps = args.max_train_epochs * math.ceil(
+        len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+    )
+    accelerator.print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
 
     # lr schedulerを用意する
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
-    # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
+    # 実験的機能：勾配も含めたfp16学習を行う　モデル全体をfp16にする
     if args.full_fp16:
         assert (
             args.mixed_precision == "fp16"
         ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
         accelerator.print("enable full fp16 training.")
-        unet.to(weight_dtype)
-        text_encoder1.to(weight_dtype)
-        text_encoder2.to(weight_dtype)
-    elif args.full_bf16:
-        assert (
-            args.mixed_precision == "bf16"
-        ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
-        accelerator.print("enable full bf16 training.")
         unet.to(weight_dtype)
         text_encoder1.to(weight_dtype)
         text_encoder2.to(weight_dtype)
@@ -306,16 +258,23 @@ def train(args):
         (unet,) = train_util.transform_models_if_DDP([unet])
         text_encoder1.to(weight_dtype)
         text_encoder2.to(weight_dtype)
+        text_encoder1.eval()
+        text_encoder2.eval()
 
-    # TextEncoderの出力をキャッシュするときにはCPUへ移動する
+    # TextEncoderの出力をキャッシュする
     if args.cache_text_encoder_outputs:
-        # move Text Encoders for sampling images. Text Encoder doesn't work on CPU with fp16
+        text_encoder1_cache, text_encoder2_cache = sdxl_train_util.cache_text_encoder_outputs(
+            args, accelerator, (tokenizer1, tokenizer2), (text_encoder1, text_encoder2), train_dataloader, None
+        )
+        accelerator.wait_for_everyone()
+        # Text Encoder doesn't work on CPU with fp16
         text_encoder1.to("cpu", dtype=torch.float32)
         text_encoder2.to("cpu", dtype=torch.float32)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     else:
-        # make sure Text Encoders are on GPU
+        text_encoder1_cache = None
+        text_encoder2_cache = None
         text_encoder1.to(accelerator.device)
         text_encoder2.to(accelerator.device)
 
@@ -333,17 +292,14 @@ def train(args):
         args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
     # 学習する
-    # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     accelerator.print("running training / 学習開始")
-    accelerator.print(f"  num examples / サンプル数: {train_dataset_group.num_train_images}")
     accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
     accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
+    accelerator.print(f"  batch size per device / バッチサイズ: {args.train_batch_size}")
     accelerator.print(
-        f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
+        f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}"
     )
-    # accelerator.print(
-    #     f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}"
-    # )
     accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
     accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
@@ -354,16 +310,12 @@ def train(args):
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
     )
     prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
-    if args.zero_terminal_snr:
-        custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
 
     if accelerator.is_main_process:
-        init_kwargs = {}
-        if args.log_tracker_config is not None:
-            init_kwargs = toml.load(args.log_tracker_config)
-        accelerator.init_trackers("finetuning" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs)
+        accelerator.init_trackers("finetuning" if args.log_tracker_name is None else args.log_tracker_name)
 
     for epoch in range(num_train_epochs):
+
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
 
@@ -372,24 +324,29 @@ def train(args):
 
         loss_total = 0
         for step, batch in enumerate(train_dataloader):
+            if (batch.get("error")):
+                print(f"Step {step} is completely fucked up yo yo yo!")
+                continue
+
             current_step.value = global_step
-            with accelerator.accumulate(training_models[0]):  # 複数モデルに対応していない模様だがとりあえずこうしておく
-                if "latents" in batch and batch["latents"] is not None:
-                    latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
-                else:
-                    with torch.no_grad():
-                        # latentに変換
-                        latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
+            # with accelerator.accumulate(training_models[0]):  # 複数モデルに対応していない模様だがとりあえずこうしておく
+            if True:
+                with torch.no_grad():
+                    # latentに変換
+                    latents = list(map(lambda x: image_transforms(Image.open(io.BytesIO(x)).convert('RGB')), batch["latents"]))
+                    latents = torch.stack(latents).to(device=accelerator.device, dtype=vae_dtype)
+                    latents = vae.encode(latents).latent_dist.sample().to(weight_dtype)
 
-                        # NaNが含まれていれば警告を表示し0に置き換える
-                        if torch.any(torch.isnan(latents)):
-                            accelerator.print("NaN found in latents, replacing with zeros")
-                            latents = torch.where(torch.isnan(latents), torch.zeros_like(latents), latents)
+                    # NaNが含まれていれば警告を表示し0に置き換える
+                    if torch.any(torch.isnan(latents)):
+                        accelerator.print("NaN found in latents, replacing with zeros")
+                        latents = torch.where(torch.isnan(latents), torch.zeros_like(latents), latents)
                 latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
+                b_size = latents.shape[0]
 
-                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
-                    input_ids1 = batch["input_ids"]
-                    input_ids2 = batch["input_ids2"]
+                input_ids1 = torch.stack(batch["input_ids"])
+                input_ids2 = torch.stack(batch["input_ids2"])
+                if not args.cache_text_encoder_outputs:
                     with torch.set_grad_enabled(args.train_text_encoder):
                         # Get the text embedding for conditioning
                         # TODO support weighted captions
@@ -405,8 +362,8 @@ def train(args):
                         # else:
                         input_ids1 = input_ids1.to(accelerator.device)
                         input_ids2 = input_ids2.to(accelerator.device)
-                        encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
-                            args.max_token_length,
+                        encoder_hidden_states1, encoder_hidden_states2, pool2 = sdxl_train_util.get_hidden_states(
+                            args,
                             input_ids1,
                             input_ids2,
                             tokenizer1,
@@ -416,26 +373,19 @@ def train(args):
                             None if not args.full_fp16 else weight_dtype,
                         )
                 else:
-                    encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
-                    encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
-                    pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
-
-                    # # verify that the text encoder outputs are correct
-                    # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
-                    #     args.max_token_length,
-                    #     batch["input_ids"].to(text_encoder1.device),
-                    #     batch["input_ids2"].to(text_encoder1.device),
-                    #     tokenizer1,
-                    #     tokenizer2,
-                    #     text_encoder1,
-                    #     text_encoder2,
-                    #     None if not args.full_fp16 else weight_dtype,
-                    # )
-                    # b_size = encoder_hidden_states1.shape[0]
-                    # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # print("text encoder outputs verified")
+                    encoder_hidden_states1 = []
+                    encoder_hidden_states2 = []
+                    pool2 = []
+                    for input_id1, input_id2 in zip(input_ids1, input_ids2):
+                        input_id1_cache_key = tuple(input_id1.squeeze(0).flatten().tolist())
+                        input_id2_cache_key = tuple(input_id2.squeeze(0).flatten().tolist())
+                        encoder_hidden_states1.append(text_encoder1_cache[input_id1_cache_key])
+                        hidden_states2, p2 = text_encoder2_cache[input_id2_cache_key]
+                        encoder_hidden_states2.append(hidden_states2)
+                        pool2.append(p2)
+                    encoder_hidden_states1 = torch.stack(encoder_hidden_states1).to(accelerator.device).to(weight_dtype)
+                    encoder_hidden_states2 = torch.stack(encoder_hidden_states2).to(accelerator.device).to(weight_dtype)
+                    pool2 = torch.stack(pool2).to(accelerator.device).to(weight_dtype)
 
                 # get size embeddings
                 orig_size = batch["original_sizes_hw"]
