@@ -33,7 +33,7 @@ lr_warmup_steps = 0
 sample_every_n_steps = 10000000 # basically never
 log_with = "wandb"
 log_tracker_name = "wdxl"
-
+logging_dir = "/mnt/wd-dataset/log"
 
 # Saving settings
 save_model_as = "safetensors"
