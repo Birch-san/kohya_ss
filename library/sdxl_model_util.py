@@ -2,11 +2,13 @@ import torch
 from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors.torch import load_file, save_file
+import transformers
 from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer
 from typing import List
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
 from library import sdxl_original_unet
+from packaging import version
 
 
 VAE_SCALE_FACTOR = 0.13025
@@ -126,9 +128,14 @@ def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
             new_sd[key_pfx + "k_proj" + key_suffix] = values[1]
             new_sd[key_pfx + "v_proj" + key_suffix] = values[2]
 
-    # original SD にはないので、position_idsを追加
-    position_ids = torch.Tensor([list(range(max_length))]).to(torch.int64)
-    new_sd["text_model.embeddings.position_ids"] = position_ids
+    # Create position_ids only for *old* transformers versions.
+    # After transformers==4.31, position_ids becomes a persistent=False buffer (so we musn't supply it)
+    # https://github.com/huggingface/transformers/pull/24505
+    # https://github.com/mlfoundations/open_clip/pull/595
+    if version.parse(transformers.__version__) <= version.parse("4.31"):
+        # original SD にはないので、position_idsを追加
+        position_ids = torch.Tensor([list(range(max_length))]).to(torch.int64)
+        new_sd["text_model.embeddings.position_ids"] = position_ids
 
     # logit_scale はDiffusersには含まれないが、保存時に戻したいので別途返す
     logit_scale = checkpoint.get(SDXL_KEY_PREFIX + "logit_scale", None)
@@ -257,6 +264,12 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         elif k.startswith("conditioner.embedders.1.model."):
             te2_sd[k] = state_dict.pop(k)
 
+    if version.parse(transformers.__version__) > version.parse("4.31"):
+        # After transformers==4.31, position_ids becomes a persistent=False buffer (so we musn't supply it)
+        # https://github.com/huggingface/transformers/pull/24505
+        # https://github.com/mlfoundations/open_clip/pull/595
+        if 'text_model.embeddings.position_ids' in te1_sd:
+            del te1_sd['text_model.embeddings.position_ids']
     info1 = text_model1.load_state_dict(te1_sd)
     print("text encoder 1:", info1)
 
