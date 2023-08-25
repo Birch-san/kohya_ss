@@ -4,7 +4,7 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors.torch import load_file, save_file
 import transformers
 from transformers import CLIPTextModel, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer
-from typing import List
+from typing import List, Optional
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
 from library import sdxl_original_unet
@@ -527,7 +527,7 @@ def save_stable_diffusion_checkpoint(
 
 
 def save_diffusers_checkpoint(
-    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None
+    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None, save_variant: Optional[str]=None
 ):
     from diffusers import StableDiffusionXLPipeline
 
@@ -575,4 +575,4 @@ def save_diffusers_checkpoint(
     )
     if save_dtype is not None:
         pipeline.to(None, save_dtype)
-    pipeline.save_pretrained(output_dir, safe_serialization=use_safetensors)
+    pipeline.save_pretrained(output_dir, safe_serialization=use_safetensors, variant=save_variant)
