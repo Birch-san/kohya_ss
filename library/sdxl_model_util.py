@@ -165,7 +165,7 @@ def _load_state_dict_on_device(model, state_dict, device, dtype=None):
     raise RuntimeError("Error(s) in loading state_dict for {}:\n\t{}".format(model.__class__.__name__, "\n\t".join(error_msgs)))
 
 
-def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None):
+def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None, unet_only=False):
     # model_version is reserved for future use
     # dtype is reserved for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
 
@@ -202,6 +202,8 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
     info = _load_state_dict_on_device(unet, unet_sd, device=map_location)
     print("U-Net: ", info)
+    if unet_only:
+        return None, None, None, unet, None, None
 
     # Text Encoders
     print("building text encoders")
@@ -527,7 +529,7 @@ def save_stable_diffusion_checkpoint(
 
 
 def save_diffusers_checkpoint(
-    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None, save_variant: Optional[str]=None
+    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None, save_variant: Optional[str]=None, unet_only=False
 ):
     from diffusers import StableDiffusionXLPipeline
 
@@ -539,6 +541,9 @@ def save_diffusers_checkpoint(
     if save_dtype is not None:
         diffusers_unet.to(save_dtype)
     diffusers_unet.load_state_dict(du_unet_sd)
+    if unet_only:
+        diffusers_unet.save_pretrained(f'{output_dir}/unet', safe_serialization=use_safetensors, variant=save_variant)
+        return
 
     # create pipeline to save
     if pretrained_model_name_or_path is None:
